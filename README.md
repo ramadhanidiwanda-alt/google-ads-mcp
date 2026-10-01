@@ -101,6 +101,42 @@ to enable the following APIs in your Google Cloud project:
 * [Google Ads API](https://console.cloud.google.com/apis/library/googleads.googleapis.com)
 
 ### Configure Credentials
+#### Hosted Cuan mode
+
+For organization-managed deployments, set `GOOGLE_ADS_MCP_MODE=cuan`. This mode
+uses Cuan Insight as the credential and policy authority and serves only the
+bounded tools below over Streamable HTTP:
+
+- `ads_list_campaigns`: customer ID must be exactly ten digits; one result page
+  contains 1–100 campaigns (default 20).
+- `ads_preview_campaign_rename`: creates a five-minute preview for a paused
+  campaign whose current name matches the supplied expected name.
+- `ads_rename_campaign`: requires the exact preview binding, an
+  execution ID, and explicit confirmation. Cuan atomically claims the preview
+  before dispatch and records confirmed, not-dispatched, or uncertain outcomes.
+
+If the organization's write policy requires human approval, Cuan must approve
+the preview before `ads_rename_campaign` can claim it.
+
+Hosted mode does not mount the upstream arbitrary `search`, metadata tools, or
+resources. It does not use local Application Default Credentials or FastMCP
+OAuth storage. Each tool call must carry `x-cuan-mcp-connection-key`; Cuan
+rechecks the organization's grant and returns an ephemeral Google access token
+to the server. Configure the private runtime URL and service credentials on the
+server only:
+
+```shell
+GOOGLE_ADS_MCP_MODE=cuan
+CUAN_GOOGLE_ADS_RUNTIME_URL=https://YOUR_PROJECT.supabase.co/functions/v1/google-ads-runtime
+GOOGLE_ADS_PRIVATE_SERVICE_ID=YOUR_PRIVATE_SERVICE_ID
+GOOGLE_ADS_PRIVATE_SERVICE_SECRET=YOUR_PRIVATE_SERVICE_SECRET
+PORT=8080
+```
+
+The runtime URL must use HTTPS. Do not set the FastMCP OAuth client ID or
+secret in Cuan mode. Configure Kong and the MCP client to preserve the
+`x-cuan-mcp-connection-key` header.
+
 #### Option 1: Using FastMCP OAuth Proxy
 
 The server supports FastMCP's [OAuth proxy](https://gofastmcp.com/servers/auth/oauth-proxy) feature for dynamic user authentication. This is useful when running the server as a web service.
