@@ -15,8 +15,11 @@
 """Test cases for the server module."""
 
 import logging
+import os
+import subprocess
+import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 class TestUtils(unittest.TestCase):
@@ -84,3 +87,67 @@ class TestUtils(unittest.TestCase):
                 server.run_server()
 
         run.assert_called_once_with()
+
+    def test_cuan_mode_uses_streamable_http_without_upstream_oauth(self):
+        from ads_mcp import server
+
+        env = {
+            "GOOGLE_ADS_MCP_MODE": "cuan",
+            "CUAN_GOOGLE_ADS_RUNTIME_URL": "https://cuan.example/functions/v1/google-ads-runtime",
+            "GOOGLE_ADS_PRIVATE_SERVICE_ID": "ads-mcp",
+            "GOOGLE_ADS_PRIVATE_SERVICE_SECRET": "s" * 40,
+            "PORT": "18081",
+        }
+        hosted = Mock()
+        with patch.dict(server.os.environ, env, clear=True):
+            with patch.object(
+                server, "_create_cuan_server", return_value=hosted
+            ):
+                server.run_server()
+
+        hosted.run.assert_called_once_with(
+            transport="streamable-http",
+            port=18081,
+            host="0.0.0.0",
+            uvicorn_config={"access_log": False},
+        )
+
+    def test_cuan_mode_rejects_fastmcp_oauth_configuration(self):
+        from ads_mcp import server
+
+        env = {
+            "GOOGLE_ADS_MCP_MODE": "cuan",
+            "GOOGLE_ADS_MCP_OAUTH_CLIENT_ID": "local-client",
+            "GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET": "local-secret",
+        }
+        with patch.dict(server.os.environ, env, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "FastMCP OAuth must be unset"
+            ):
+                server._create_cuan_server()
+
+    def test_fresh_cuan_process_never_imports_local_coordinator(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "GOOGLE_ADS_MCP_MODE": "cuan",
+                "CUAN_GOOGLE_ADS_RUNTIME_URL": "https://cuan.example/functions/v1/google-ads-runtime",
+                "GOOGLE_ADS_PRIVATE_SERVICE_ID": "google-ads-mcp",
+                "GOOGLE_ADS_PRIVATE_SERVICE_SECRET": "s" * 40,
+            }
+        )
+        env.pop("GOOGLE_ADS_MCP_OAUTH_CLIENT_ID", None)
+        env.pop("GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; import ads_mcp.server; "
+                "assert 'ads_mcp.coordinator' not in sys.modules",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
