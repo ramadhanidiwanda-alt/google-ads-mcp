@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from fastmcp import Client
-
+from ads_mcp.hosted_ingress import PrivateIngress
 from ads_mcp.hosted_server import create_hosted_server
 
 
@@ -64,6 +64,36 @@ class HostedServerTests(unittest.IsolatedAsyncioTestCase):
         control.authorize.assert_awaited_once_with(
             "connection-key", "list_campaigns", "1234567890", None
         )
+
+
+class PrivateIngressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requires_exact_host_and_private_secret(self):
+        async def inner(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        app = PrivateIngress(inner, "s" * 32, "google-ads-mcp.cuaninsight.com")
+
+        async def status(headers):
+            events = []
+
+            async def send(event):
+                events.append(event)
+
+            async def receive():
+                return {"type": "http.request", "body": b""}
+
+            await app(
+                {"type": "http", "headers": headers}, receive, send
+            )
+            return events[0]["status"]
+
+        host = (b"host", b"google-ads-mcp.cuaninsight.com")
+        proof = (b"x-cuan-google-ads-ingress-secret", b"s" * 32)
+        self.assertEqual(await status([host, proof]), 200)
+        self.assertEqual(await status([proof]), 403)
+        self.assertEqual(await status([host]), 403)
+        self.assertEqual(await status([host, host, proof]), 403)
 
 
 if __name__ == "__main__":

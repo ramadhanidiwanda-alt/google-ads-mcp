@@ -441,6 +441,18 @@ class HostedGoogleAdsService:
             credential.get("accessToken"), str
         ):
             raise PermissionError("Cuan provider credential was invalid")
+        refreshed_grant = await self.control.authorize(
+            connection_key, "rename_campaign", customer_id, campaign_id
+        )
+        self._validate_grant(
+            refreshed_grant, "rename_campaign", customer_id, campaign_id
+        )
+        if any(
+            refreshed_grant[key] != grant[key]
+            for key in ("grantId", "credentialRef")
+        ):
+            raise PermissionError("Cuan Google Ads grant changed during preview")
+        grant = refreshed_grant
         current = await self._read_campaign(
             credential, customer_id, campaign_id
         )
@@ -510,6 +522,28 @@ class HostedGoogleAdsService:
             connection_key, "rename_campaign", customer_id, campaign_id
         )
         self._validate_grant(grant, "rename_campaign", customer_id, campaign_id)
+        credential = await self.control.resolve_credential(
+            connection_key,
+            "rename_campaign",
+            customer_id,
+            grant["credentialRef"],
+        )
+        if not isinstance(credential, dict) or not isinstance(
+            credential.get("accessToken"), str
+        ):
+            raise PermissionError("Cuan provider credential was invalid")
+        refreshed_grant = await self.control.authorize(
+            connection_key, "rename_campaign", customer_id, campaign_id
+        )
+        self._validate_grant(
+            refreshed_grant, "rename_campaign", customer_id, campaign_id
+        )
+        if any(
+            refreshed_grant[key] != grant[key]
+            for key in ("grantId", "credentialRef")
+        ):
+            raise PermissionError("Cuan Google Ads grant changed during execution")
+        grant = refreshed_grant
         binding: dict[str, Any] = {
             "customerId": customer_id,
             "campaignId": campaign_id,
@@ -544,16 +578,6 @@ class HostedGoogleAdsService:
         outcome = "not_dispatched"
         failure: Exception | None = None
         try:
-            credential = await self.control.resolve_credential(
-                connection_key,
-                "rename_campaign",
-                customer_id,
-                grant["credentialRef"],
-            )
-            if not isinstance(credential, dict) or not isinstance(
-                credential.get("accessToken"), str
-            ):
-                raise PermissionError("Cuan provider credential was invalid")
             current = await self._read_campaign(
                 credential, customer_id, campaign_id
             )

@@ -371,6 +371,21 @@ class HostedGoogleAdsServiceTests(unittest.IsolatedAsyncioTestCase):
             "connection-key", binding
         )
 
+    async def test_preview_uses_revision_after_credential_refresh(self):
+        self.configure_rename()
+        refreshed = {**self.grant, "policyRevision": "policy-2"}
+        self.control.authorize.side_effect = [self.grant, refreshed]
+        self.control.issue_preview.side_effect = lambda key, binding: {
+            **binding,
+            "previewId": "preview-1",
+            "confirmationToken": "token_1234567890",
+        }
+        preview = await self.service.preview_campaign_rename(
+            "connection-key", "1234567890", "42", "Spring", "Spring 2026"
+        )
+        self.assertEqual(preview["requestDigest"], rename_digest(preview, refreshed))
+        self.assertEqual(self.control.authorize.await_count, 2)
+
     async def test_rename_claims_then_dispatches_and_consumes_reservation(self):
         self.configure_rename()
         updated = {
