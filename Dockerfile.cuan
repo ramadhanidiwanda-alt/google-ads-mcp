@@ -1,0 +1,20 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    GOOGLE_ADS_MCP_MODE=cuan \
+    PORT=8080
+
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE MANIFEST.in ./
+COPY ads_mcp ./ads_mcp
+
+RUN pip install --no-cache-dir . && \
+    groupadd --system --gid 10001 cuan && \
+    useradd --system --uid 10001 --gid 10001 --no-create-home cuan
+
+USER 10001:10001
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+    CMD python -c "import socket; socket.create_connection(('127.0.0.1', 8080), 2).close()"
+CMD ["google-ads-mcp"]
