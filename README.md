@@ -1,5 +1,16 @@
 # Google Ads MCP Server
 
+## Cuan Insight hosted container
+
+Build the private provider service with `docker build -f Dockerfile.cuan -t cuan-google-ads-mcp .`.
+The image selects `GOOGLE_ADS_MCP_MODE=cuan` and listens on port 8080. It requires
+`CUAN_GOOGLE_ADS_RUNTIME_URL`, `GOOGLE_ADS_PRIVATE_SERVICE_ID`, and
+`GOOGLE_ADS_PRIVATE_SERVICE_SECRET` at runtime. Keep the service on a private
+network behind Kong; do not publish port 8080 directly. Kong must authenticate
+the Connection Key and forward it as `x-cuan-mcp-connection-key` to this service.
+The Cuan runtime must authorize each operation and remains disabled until OAuth,
+account grants, plan capabilities, and live acceptance are ready.
+
 This repo contains the source code for running an
 [MCP](https://modelcontextprotocol.io) server that interacts with the
 [Google Ads API](https://developers.google.com/google-ads/api).
