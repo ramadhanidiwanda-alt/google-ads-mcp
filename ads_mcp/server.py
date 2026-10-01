@@ -42,6 +42,7 @@ def _create_cuan_server():
         "CUAN_GOOGLE_ADS_RUNTIME_URL",
         "GOOGLE_ADS_PRIVATE_SERVICE_ID",
         "GOOGLE_ADS_PRIVATE_SERVICE_SECRET",
+        "GOOGLE_ADS_INGRESS_SECRET",
     ):
         if not os.environ.get(name):
             raise ValueError(
@@ -76,12 +77,18 @@ def run_server() -> None:
 
     if mode == "cuan":
         server = mcp if _IMPORTED_MODE == "cuan" else _create_cuan_server()
-        server.run(
-            transport="streamable-http",
-            port=port,
-            host="0.0.0.0",
-            uvicorn_config={"access_log": False},
+        import uvicorn
+
+        from ads_mcp.hosted_ingress import PrivateIngress
+
+        app = PrivateIngress(
+            server.http_app(),
+            os.environ["GOOGLE_ADS_INGRESS_SECRET"],
+            os.environ.get(
+                "GOOGLE_ADS_MCP_ALLOWED_HOST", "google-ads-mcp.cuaninsight.com"
+            ),
         )
+        uvicorn.run(app, host="0.0.0.0", port=port, access_log=False)
     elif os.environ.get("GOOGLE_ADS_MCP_OAUTH_CLIENT_ID") and os.environ.get(
         "GOOGLE_ADS_MCP_OAUTH_CLIENT_SECRET"
     ):

@@ -96,21 +96,19 @@ class TestUtils(unittest.TestCase):
             "CUAN_GOOGLE_ADS_RUNTIME_URL": "https://cuan.example/functions/v1/google-ads-runtime",
             "GOOGLE_ADS_PRIVATE_SERVICE_ID": "ads-mcp",
             "GOOGLE_ADS_PRIVATE_SERVICE_SECRET": "s" * 40,
+            "GOOGLE_ADS_INGRESS_SECRET": "i" * 40,
             "PORT": "18081",
         }
         hosted = Mock()
         with patch.dict(server.os.environ, env, clear=True):
             with patch.object(
                 server, "_create_cuan_server", return_value=hosted
-            ):
+            ), patch("uvicorn.run") as run:
                 server.run_server()
 
-        hosted.run.assert_called_once_with(
-            transport="streamable-http",
-            port=18081,
-            host="0.0.0.0",
-            uvicorn_config={"access_log": False},
-        )
+        hosted.http_app.assert_called_once_with()
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["port"], 18081)
 
     def test_cuan_mode_rejects_fastmcp_oauth_configuration(self):
         from ads_mcp import server
@@ -134,6 +132,7 @@ class TestUtils(unittest.TestCase):
                 "CUAN_GOOGLE_ADS_RUNTIME_URL": "https://cuan.example/functions/v1/google-ads-runtime",
                 "GOOGLE_ADS_PRIVATE_SERVICE_ID": "google-ads-mcp",
                 "GOOGLE_ADS_PRIVATE_SERVICE_SECRET": "s" * 40,
+                "GOOGLE_ADS_INGRESS_SECRET": "i" * 40,
             }
         )
         env.pop("GOOGLE_ADS_MCP_OAUTH_CLIENT_ID", None)
