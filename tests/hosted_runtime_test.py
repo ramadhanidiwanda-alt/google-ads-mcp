@@ -54,6 +54,35 @@ class UnifiedInvocationTests(unittest.IsolatedAsyncioTestCase):
         ads.search_campaigns.assert_not_awaited()
         service._finalize.assert_awaited_once()
 
+    async def test_unified_campaign_read_omits_sunset_developer_token(self):
+        for obsolete_token in ("", "obsolete-developer-token"):
+            with self.subTest(obsolete_token=bool(obsolete_token)):
+                service = UnifiedGoogleAdsService(
+                    "https://cuan.example/redeem", "service", "s" * 32,
+                    GoogleAdsRestClient(api_version="v25"),
+                )
+                service._redeem = AsyncMock(return_value={
+                    "ok": True, "provider": "google", "resourceId": "1234567890",
+                    "providerTarget": "1234567890", "accessToken": "transient",
+                })
+                service._finalize = AsyncMock()
+                response = BytesIO(
+                    b'[{"results":[{"campaign":{"id":"42","name":"Owned",'
+                    b'"status":"ENABLED","resourceName":'
+                    b'"customers/1234567890/campaigns/42"}}]}]'
+                )
+                invocation = self.invocation(
+                    "google_ads_list_campaigns", {"accountId": "1234567890"}
+                )
+                with patch.dict("os.environ", {"GOOGLE_ADS_DEVELOPER_TOKEN": obsolete_token}), \
+                    patch("ads_mcp.hosted_runtime.urlopen", return_value=nullcontext(response)) as urlopen:
+                    result = await service.invoke("google_ads_list_campaigns", invocation)
+                self.assertEqual(result["campaigns"][0]["id"], "42")
+                request = urlopen.call_args.args[0]
+                self.assertEqual(request.get_header("Authorization"), "Bearer transient")
+                self.assertIsNone(request.get_header("Developer-token"))
+                service._finalize.assert_awaited_once_with(invocation, "succeeded")
+
     async def test_changed_exact_argument_bytes_deny_before_redemption(self):
         service = UnifiedGoogleAdsService("https://cuan.example/redeem", "service", "s" * 32, AsyncMock())
         service._redeem = AsyncMock()
