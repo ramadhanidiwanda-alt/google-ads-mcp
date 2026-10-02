@@ -523,10 +523,8 @@ class UnifiedGoogleAdsService:
         customer = parse_customer_id(invocation["resourceId"])
         if redeemed.get("providerTarget") not in (None, customer):
             raise PermissionError("Google Ads provider target mismatch")
-        credential = {"accessToken": token, "developerToken": os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        credential = {"accessToken": token,
                       "loginCustomerId": redeemed.get("loginCustomerId")}
-        if not credential["developerToken"]:
-            raise PermissionError("Google Ads developer token unavailable")
         if tool == "google_ads_list_campaigns":
             size = parse_page_size(args.get("pageSize", 20))
             rows = await self.ads.search_campaigns(credential, customer, campaign_query(size), size)
