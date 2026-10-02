@@ -52,6 +52,17 @@ class GoogleAdsApiFailureTests(unittest.TestCase):
         self.assertNotIn("secret-token", str(caught.exception))
         self.assertNotIn("private-name", str(caught.exception))
 
+    def test_streaming_http_failure_unwraps_array_and_service_reason(self):
+        payload = [{"error": {"status": "PERMISSION_DENIED", "message": "secret-token",
+            "details": [{"reason": "SERVICE_DISABLED", "metadata": {"consumer": "private"}}]}}]
+        error = HTTPError("https://googleads.googleapis.com/private", 403, "secret-token", {},
+                          BytesIO(json.dumps(payload).encode()))
+        with patch("ads_mcp.hosted_runtime.urlopen", side_effect=error):
+            with self.assertRaises(GoogleAdsApiError) as caught:
+                GoogleAdsRestClient(api_version="v25")._search_campaigns(
+                    {"accessToken": "secret-token"}, "1234567890", campaign_query(3), 3)
+        self.assertEqual(str(caught.exception), "Google Ads API HTTP 403 PERMISSION_DENIED SERVICE_DISABLED")
+
     def test_malformed_http_error_has_safe_fallback(self):
         error = HTTPError("https://googleads.googleapis.com/private", 400, "secret-token", {},
                           BytesIO(b'not-json secret-token'))
