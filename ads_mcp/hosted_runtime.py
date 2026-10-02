@@ -45,12 +45,17 @@ class GoogleAdsApiError(RuntimeError):
         codes = []
         try:
             payload = json.loads(error.read(65537))
+            if isinstance(payload, list) and len(payload) == 1:
+                payload = payload[0]
             detail = payload.get("error", {}) if isinstance(payload, dict) else {}
             status = detail.get("status") if isinstance(detail, dict) else None
             if isinstance(status, str) and re.fullmatch(r"[A-Z_]{1,64}", status):
                 codes.append(status)
             details = detail.get("details", []) if isinstance(detail, dict) else []
             for item in details[:8] if isinstance(details, list) else []:
+                reason = item.get("reason") if isinstance(item, dict) else None
+                if isinstance(reason, str) and re.fullmatch(r"[A-Z_]{1,100}", reason):
+                    codes.append(reason)
                 errors = item.get("errors", []) if isinstance(item, dict) else []
                 for failure in errors[:8] if isinstance(errors, list) else []:
                     enum = failure.get("errorCode", {}) if isinstance(failure, dict) else {}
