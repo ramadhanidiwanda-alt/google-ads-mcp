@@ -37,6 +37,33 @@ EXECUTION_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 PREVIEW_TTL_MS = 5 * 60 * 1000
 
 
+class GoogleAdsApiError(RuntimeError):
+    """A bounded provider error containing no messages, queries or credentials."""
+
+    @classmethod
+    def from_http_error(cls, error: HTTPError) -> "GoogleAdsApiError":
+        codes = []
+        try:
+            payload = json.loads(error.read(65537))
+            detail = payload.get("error", {}) if isinstance(payload, dict) else {}
+            status = detail.get("status") if isinstance(detail, dict) else None
+            if isinstance(status, str) and re.fullmatch(r"[A-Z_]{1,64}", status):
+                codes.append(status)
+            details = detail.get("details", []) if isinstance(detail, dict) else []
+            for item in details[:8] if isinstance(details, list) else []:
+                errors = item.get("errors", []) if isinstance(item, dict) else []
+                for failure in errors[:8] if isinstance(errors, list) else []:
+                    enum = failure.get("errorCode", {}) if isinstance(failure, dict) else {}
+                    for category, value in enum.items() if isinstance(enum, dict) else []:
+                        if (isinstance(category, str) and re.fullmatch(r"[a-zA-Z]{1,64}", category)
+                                and isinstance(value, str) and re.fullmatch(r"[A-Z_]{1,100}", value)):
+                            codes.append(f"{category}.{value}")
+        except (ValueError, OSError):
+            pass
+        return cls(f"Google Ads API HTTP {error.code}" +
+                   (" " + " ".join(dict.fromkeys(codes)) if codes else ""))
+
+
 def parse_customer_id(value: Any) -> str:
     """Validate a customer ID without silently normalizing caller input."""
     if not isinstance(value, str) or not CUSTOMER_ID.fullmatch(value):
@@ -317,7 +344,9 @@ class GoogleAdsRestClient:
         try:
             with urlopen(request, timeout=15) as response:
                 payload = json.loads(response.read())
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        except HTTPError as exc:
+            raise GoogleAdsApiError.from_http_error(exc) from exc
+        except (URLError, TimeoutError, ValueError) as exc:
             raise RuntimeError("Google Ads campaign list failed") from exc
         if not isinstance(payload, list) or any(
             not isinstance(chunk, dict)

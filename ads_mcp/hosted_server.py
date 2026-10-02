@@ -25,6 +25,7 @@ from mcp.types import ToolAnnotations
 from ads_mcp.hosted_runtime import (
     CuanGoogleAdsRuntimeClient,
     GoogleAdsRestClient,
+    GoogleAdsApiError,
     HostedGoogleAdsService,
     UnifiedGoogleAdsService,
 )
@@ -60,7 +61,7 @@ def create_hosted_server(
             raise ToolError("Cuan Google Ads private invocation denied")
         try:
             return await unified.invoke(tool, googleInvocation)
-        except (ValueError, PermissionError) as exc:
+        except (ValueError, PermissionError, GoogleAdsApiError) as exc:
             raise ToolError(str(exc)) from exc
         except Exception as exc:
             raise ToolError("Google Ads provider operation failed or outcome unknown") from exc
