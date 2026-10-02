@@ -20,6 +20,7 @@ import json
 import os
 import re
 import time
+from datetime import date
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -262,6 +263,33 @@ class GoogleAdsRestClient:
             headers["login-customer-id"] = login_customer_id
         return headers
 
+    async def search_performance(self, credential: dict[str, Any], customer_id: str,
+                                 since: str, until: str, limit: int, offset: int = 0) -> list[dict[str, Any]]:
+        query = ("SELECT segments.date, campaign.id, campaign.name, "
+                 "metrics.cost_micros, customer.currency_code, metrics.clicks, "
+                 "metrics.impressions FROM campaign WHERE segments.date BETWEEN "
+                 f"'{since}' AND '{until}' ORDER BY segments.date ASC LIMIT {limit} OFFSET {offset}")
+        return await asyncio.to_thread(self._search_performance, credential, customer_id, query, limit)
+
+    def _search_performance(self, credential: dict[str, Any], customer_id: str,
+                            query: str, limit: int) -> list[dict[str, Any]]:
+        request = Request(
+            f"https://googleads.googleapis.com/{self.api_version}/customers/{customer_id}/googleAds:searchStream",
+            data=json.dumps({"query": query}).encode(), headers=self._headers(credential), method="POST")
+        try:
+            with urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read())
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            raise RuntimeError("Google Ads performance request failed") from exc
+        if not isinstance(payload, list) or any(not isinstance(c, dict) or
+            not isinstance(c.get("results", []), list) for c in payload):
+            raise ValueError("Google Ads performance response invalid")
+        rows = [row for chunk in payload for row in chunk.get("results", [])]
+        if len(rows) > limit:
+            raise ValueError("Google Ads performance exceeded row limit")
+        return rows
+
+
     def _search_campaigns(
         self,
         credential: dict[str, Any],
@@ -382,6 +410,187 @@ def campaign_lookup_query_from_query(query: str) -> str | None:
     return campaign_lookup_query(match.group(1)) if match else None
 
 
+class UnifiedGoogleAdsService:
+    """Execute one centrally admitted invocation with one permit redemption."""
+
+    TOOLS = {
+        "google_ads_list_customers", "google_ads_list_campaigns",
+        "google_ads_get_campaign_performance", "google_ads_preview_campaign_rename",
+        "google_ads_rename_campaign",
+    }
+
+    def __init__(self, endpoint: str, service_id: str, service_secret: str,
+                 ads: Any) -> None:
+        if not endpoint.startswith("https://") or not service_id or len(service_secret) < 32:
+            raise ValueError("Cuan Google Ads redeem configuration invalid")
+        self.endpoint, self.service_id, self.service_secret = endpoint, service_id, service_secret
+        self.ads = ads
+
+    async def _redeem(self, invocation: dict[str, Any]) -> dict[str, Any]:
+        req = Request(self.endpoint, data=json.dumps({"googleInvocation": invocation}).encode(),
+                      headers={"content-type": "application/json",
+                               "x-cuan-google-ads-service-id": self.service_id,
+                               "x-cuan-google-ads-service-secret": self.service_secret}, method="POST")
+        def send() -> dict[str, Any]:
+            try:
+                with urlopen(req, timeout=10) as response:
+                    result = json.loads(response.read())
+            except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+                raise PermissionError("Cuan Google Ads permit redemption failed") from exc
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise PermissionError("Cuan Google Ads permit denied")
+            return result
+        return await asyncio.to_thread(send)
+
+    async def _finalize(self, invocation: dict[str, Any], outcome: str) -> None:
+        endpoint = self.endpoint.rsplit("/", 1)[0] + "/mcp-finalize-execution"
+        body = json.dumps({"executionId": invocation["executionId"],
+                           "permit": invocation["permit"], "outcome": outcome}).encode()
+        req = Request(endpoint, data=body, headers={"content-type": "application/json",
+            "x-cuan-google-ads-service-id": self.service_id,
+            "x-cuan-google-ads-service-secret": self.service_secret}, method="POST")
+        def send() -> None:
+            try:
+                with urlopen(req, timeout=10) as response:
+                    ack = json.loads(response.read())
+            except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+                raise RuntimeError("Cuan Google Ads finalization unavailable; inspect before retrying") from exc
+            if not isinstance(ack, dict) or ack.get("ok") is not True:
+                raise RuntimeError("Cuan Google Ads finalization denied; inspect before retrying")
+        await asyncio.to_thread(send)
+
+    @staticmethod
+    def _input(invocation: Any, tool: str) -> dict[str, Any]:
+        if not isinstance(invocation, dict) or set(invocation) != {
+            "version", "publicTool", "provider", "resourceId", "canonicalArgumentsJson",
+            "digest", "executionId", "permit",
+        } or invocation.get("version") != 1 or invocation.get("publicTool") != tool or \
+            invocation.get("provider") != "google" or \
+            not isinstance(invocation.get("resourceId"), str) or \
+            not isinstance(invocation.get("canonicalArgumentsJson"), str) or \
+            not isinstance(invocation.get("digest"), str) or \
+            not re.fullmatch(r"[0-9a-f]{64}", invocation["digest"]) or \
+            not isinstance(invocation.get("permit"), str) or \
+            not re.fullmatch(r"[A-Za-z0-9_-]{43}", invocation["permit"]) or \
+            not isinstance(invocation.get("executionId"), str) or \
+            not EXECUTION_ID.fullmatch(invocation["executionId"]):
+            raise PermissionError("Cuan Google Ads invocation invalid")
+        raw = invocation["canonicalArgumentsJson"].encode("utf-8")
+        if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != invocation["digest"]:
+            raise PermissionError("Cuan Google Ads argument digest mismatch")
+        try:
+            args = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError("Google Ads arguments invalid") from exc
+        if not isinstance(args, dict):
+            raise ValueError("Google Ads arguments invalid")
+        if tool != "google_ads_list_customers" and args.get("accountId") != invocation["resourceId"]:
+            raise PermissionError("Google Ads target mismatch")
+        if tool == "google_ads_list_customers" and invocation["resourceId"]:
+            raise PermissionError("Google Ads discovery target invalid")
+        return args
+
+    async def invoke(self, tool: str, invocation: Any) -> Any:
+        state = {"validated": False, "redeemed": False, "mutation_dispatched": False}
+        try:
+            result = await self._invoke(tool, invocation, state)
+        except Exception:
+            if state["validated"]:
+                await self._finalize(invocation, "failed_after_dispatch" if state["mutation_dispatched"] else "failed_before_dispatch")
+            raise
+        if state["redeemed"]:
+            await self._finalize(invocation, "succeeded")
+        return result
+
+    async def _invoke(self, tool: str, invocation: Any, state: dict[str, bool]) -> Any:
+        if tool not in self.TOOLS:
+            raise ValueError("Google Ads tool unsupported")
+        args = self._input(invocation, tool)
+        state["validated"] = True
+        redeemed = await self._redeem(invocation)
+        state["redeemed"] = True
+        if redeemed.get("provider") != "google" or \
+            redeemed.get("resourceId") != invocation["resourceId"]:
+            raise PermissionError("Cuan Google Ads redeemed target mismatch")
+        if tool == "google_ads_list_customers":
+            resources = redeemed.get("resources")
+            if not isinstance(resources, list):
+                raise PermissionError("Cuan Google Ads grants unavailable")
+            return {"customers": resources}
+        token = redeemed.get("accessToken")
+        if not isinstance(token, str) or not token or len(token) > 8192:
+            raise PermissionError("Cuan Google Ads token unavailable")
+        customer = parse_customer_id(invocation["resourceId"])
+        if redeemed.get("providerTarget") not in (None, customer):
+            raise PermissionError("Google Ads provider target mismatch")
+        credential = {"accessToken": token, "developerToken": os.environ.get("GOOGLE_ADS_DEVELOPER_TOKEN"),
+                      "loginCustomerId": redeemed.get("loginCustomerId")}
+        if not credential["developerToken"]:
+            raise PermissionError("Google Ads developer token unavailable")
+        if tool == "google_ads_list_campaigns":
+            size = parse_page_size(args.get("pageSize", 20))
+            rows = await self.ads.search_campaigns(credential, customer, campaign_query(size), size)
+            return {"campaigns": [HostedGoogleAdsService._parse_campaign(row, customer) for row in rows]}
+        if tool == "google_ads_get_campaign_performance":
+            since, until = args.get("since"), args.get("until")
+            try:
+                start, end = date.fromisoformat(since), date.fromisoformat(until)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Google Ads report dates invalid") from exc
+            if end < start or (end - start).days >= 31:
+                raise ValueError("Google Ads report range exceeds 31 days")
+            limit = args.get("limit", 100)
+            if type(limit) is not int or not 1 <= limit <= 1000:
+                raise ValueError("Google Ads report limit invalid")
+            prefix = hashlib.sha256(f"{customer}:{since}:{until}:{limit}".encode()).hexdigest()[:16]
+            cursor = args.get("cursor")
+            offset = 0
+            if cursor is not None:
+                match = re.fullmatch(rf"{prefix}:([0-9]{{1,7}})", cursor) if isinstance(cursor, str) else None
+                if match is None:
+                    raise ValueError("Google Ads report cursor invalid")
+                offset = int(match.group(1))
+            rows = await self.ads.search_performance(credential, customer, since, until, limit, offset)
+            return {"rows": rows, "nextCursor": f"{prefix}:{offset + limit}" if len(rows) == limit else None}
+        campaign_id = args.get("campaignId")
+        expected = args.get("expectedOldName")
+        proposed = args.get("newName")
+        HostedGoogleAdsService._validate_rename(customer, campaign_id, expected, proposed)
+        service = HostedGoogleAdsService(None, self.ads)
+        try:
+            current = await service._read_campaign(credential, customer, campaign_id)
+            service._require_rename_preconditions(current, expected)
+        except Exception:
+            raise
+        if tool == "google_ads_preview_campaign_rename":
+            if not isinstance(redeemed.get("previewId"), str) or not redeemed["previewId"] or \
+                not isinstance(redeemed.get("approvalDigest"), str) or \
+                not re.fullmatch(r"[0-9a-f]{64}", redeemed["approvalDigest"]):
+                raise PermissionError("Cuan Google Ads preview binding unavailable")
+            return {"customerId": customer, "campaignId": campaign_id, "oldName": expected,
+                    "newName": proposed, "status": current["status"], "requiresConfirmation": True,
+                    "previewId": redeemed["previewId"], "approvalDigest": redeemed["approvalDigest"]}
+        if args.get("confirmed") is not True:
+            raise PermissionError("Explicit Google Ads rename confirmation required")
+        if redeemed.get("previewId") != args.get("previewId") or \
+            redeemed.get("approvalDigest") != args.get("approvalDigest") or \
+            not isinstance(args.get("previewId"), str) or \
+            not isinstance(args.get("approvalDigest"), str) or \
+            not re.fullmatch(r"[0-9a-f]{64}", args["approvalDigest"]):
+            raise PermissionError("Cuan Google Ads rename claim mismatch")
+        try:
+            state["mutation_dispatched"] = True
+            resource = await self.ads.rename_campaign(credential, customer, campaign_id, proposed)
+            updated = await service._read_campaign(credential, customer, campaign_id)
+        except Exception as exc:
+            raise RuntimeError("Google Ads rename outcome unknown; inspect campaign before retrying") from exc
+        if resource != f"customers/{customer}/campaigns/{campaign_id}" or \
+            updated["name"] != proposed or updated["status"] != current["status"]:
+            raise RuntimeError("Google Ads rename outcome unknown; inspect campaign before retrying")
+        return {"customerId": customer, "campaignId": campaign_id, "oldName": expected,
+                "newName": proposed, "status": updated["status"], "executionId": invocation["executionId"]}
+
+
 class HostedGoogleAdsService:
     """Applies Cuan policy before using a short-lived Google Ads credential."""
 
@@ -484,7 +693,7 @@ class HostedGoogleAdsService:
             "expiresAt": issued["expiresAt"],
             "previewId": issued["previewId"],
             "confirmationToken": issued["confirmationToken"],
-            "status": "PAUSED",
+            "status": current["status"],
         }
 
     async def execute_campaign_rename(
@@ -602,7 +811,7 @@ class HostedGoogleAdsService:
                 updated = await self._read_campaign(
                     credential, customer_id, campaign_id
                 )
-                if updated["name"] != new_name or updated["status"] != "PAUSED":
+                if updated["name"] != new_name or updated["status"] != current["status"]:
                     raise RuntimeError(
                         "Google Ads rename readback did not match"
                     )
@@ -652,7 +861,7 @@ class HostedGoogleAdsService:
             "campaignId": campaign_id,
             "oldName": expected_old_name,
             "newName": new_name,
-            "status": "PAUSED",
+            "status": current["status"],
             "executionId": execution_id,
         }
 
@@ -694,8 +903,6 @@ class HostedGoogleAdsService:
     def _require_rename_preconditions(
         campaign: dict[str, str], expected_old_name: str
     ) -> None:
-        if campaign["status"] != "PAUSED":
-            raise PermissionError("Google Ads campaign must be PAUSED")
         if campaign["name"] != expected_old_name:
             raise PermissionError(
                 "Google Ads campaign name changed since preview"
