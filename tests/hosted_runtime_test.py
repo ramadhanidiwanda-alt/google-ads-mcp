@@ -21,11 +21,12 @@ import hashlib
 from contextlib import nullcontext
 from io import BytesIO
 from unittest.mock import AsyncMock, Mock, patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from ads_mcp.hosted_runtime import (
     CuanGoogleAdsRuntimeClient,
     GoogleAdsRestClient,
+    GoogleAdsApiError,
     HostedGoogleAdsService,
     UnifiedGoogleAdsService,
     campaign_query,
@@ -33,6 +34,32 @@ from ads_mcp.hosted_runtime import (
     parse_page_size,
     rename_digest,
 )
+
+
+class GoogleAdsApiFailureTests(unittest.TestCase):
+    def test_campaign_http_failure_exposes_only_status_and_enum_codes(self):
+        payload = {"error": {"status": "PERMISSION_DENIED", "message": "secret-token private-name",
+            "details": [{"errors": [{"errorCode": {"authorizationError": "CUSTOMER_NOT_ENABLED"},
+                "message": "secret-token private-name", "trigger": "private-name"}]}]}}
+        error = HTTPError("https://googleads.googleapis.com/private", 403, "secret-token", {},
+                          BytesIO(json.dumps(payload).encode()))
+        with patch("ads_mcp.hosted_runtime.urlopen", side_effect=error):
+            with self.assertRaises(GoogleAdsApiError) as caught:
+                GoogleAdsRestClient(api_version="v25")._search_campaigns(
+                    {"accessToken": "secret-token"}, "1234567890", campaign_query(3), 3)
+        self.assertEqual(str(caught.exception),
+            "Google Ads API HTTP 403 PERMISSION_DENIED authorizationError.CUSTOMER_NOT_ENABLED")
+        self.assertNotIn("secret-token", str(caught.exception))
+        self.assertNotIn("private-name", str(caught.exception))
+
+    def test_malformed_http_error_has_safe_fallback(self):
+        error = HTTPError("https://googleads.googleapis.com/private", 400, "secret-token", {},
+                          BytesIO(b'not-json secret-token'))
+        with patch("ads_mcp.hosted_runtime.urlopen", side_effect=error):
+            with self.assertRaises(GoogleAdsApiError) as caught:
+                GoogleAdsRestClient(api_version="v25")._search_campaigns(
+                    {"accessToken": "secret-token"}, "1234567890", campaign_query(3), 3)
+        self.assertEqual(str(caught.exception), "Google Ads API HTTP 400")
 
 
 class UnifiedInvocationTests(unittest.IsolatedAsyncioTestCase):
