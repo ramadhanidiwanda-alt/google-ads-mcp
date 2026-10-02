@@ -26,6 +26,7 @@ from ads_mcp.hosted_runtime import (
     CuanGoogleAdsRuntimeClient,
     GoogleAdsRestClient,
     HostedGoogleAdsService,
+    UnifiedGoogleAdsService,
 )
 
 
@@ -42,11 +43,52 @@ def create_hosted_server(
     if ads is None:
         ads = GoogleAdsRestClient()
     service = HostedGoogleAdsService(control, ads)
+    redeem_url = os.environ.get("CUAN_GOOGLE_ADS_REDEEM_URL")
+    if not redeem_url and os.environ.get("CUAN_GOOGLE_ADS_RUNTIME_URL"):
+        redeem_url = os.environ["CUAN_GOOGLE_ADS_RUNTIME_URL"].rsplit("/", 1)[0] + "/mcp-redeem-google-permit"
+    unified = UnifiedGoogleAdsService(redeem_url,
+        os.environ["GOOGLE_ADS_PRIVATE_SERVICE_ID"],
+        os.environ["GOOGLE_ADS_PRIVATE_SERVICE_SECRET"], ads) if redeem_url else None
     server = FastMCP("Cuan Google Ads")
 
     def connection_key() -> str:
         headers = get_http_headers(include={"x-cuan-mcp-connection-key"})
         return headers.get("x-cuan-mcp-connection-key", "")
+
+    async def invoke_unified(tool: str, googleInvocation: dict[str, Any]) -> Any:
+        if connection_key() or unified is None:
+            raise ToolError("Cuan Google Ads private invocation denied")
+        try:
+            return await unified.invoke(tool, googleInvocation)
+        except (ValueError, PermissionError) as exc:
+            raise ToolError(str(exc)) from exc
+        except Exception as exc:
+            raise ToolError("Google Ads provider operation failed or outcome unknown") from exc
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_ads_list_customers(googleInvocation: dict[str, Any]) -> Any:
+        """List only Google Ads customers allocated to this Cuan grant."""
+        return await invoke_unified("google_ads_list_customers", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_ads_list_campaigns(googleInvocation: dict[str, Any]) -> Any:
+        """List campaigns for one allocated Google Ads customer."""
+        return await invoke_unified("google_ads_list_campaigns", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_ads_get_campaign_performance(googleInvocation: dict[str, Any]) -> Any:
+        """Read bounded campaign performance from Google Ads."""
+        return await invoke_unified("google_ads_get_campaign_performance", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def google_ads_preview_campaign_rename(googleInvocation: dict[str, Any]) -> Any:
+        """Preview a name-only update on an owned campaign."""
+        return await invoke_unified("google_ads_preview_campaign_rename", googleInvocation)
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=True))
+    async def google_ads_rename_campaign(googleInvocation: dict[str, Any]) -> Any:
+        """Rename one owned campaign after central approval and claim."""
+        return await invoke_unified("google_ads_rename_campaign", googleInvocation)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def ads_list_campaigns(
