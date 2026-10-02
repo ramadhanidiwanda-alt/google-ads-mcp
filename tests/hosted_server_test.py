@@ -59,6 +59,11 @@ class HostedServerTests(unittest.IsolatedAsyncioTestCase):
                 "ads_list_campaigns",
                 "ads_preview_campaign_rename",
                 "ads_rename_campaign",
+                "google_ads_list_customers",
+                "google_ads_list_campaigns",
+                "google_ads_get_campaign_performance",
+                "google_ads_preview_campaign_rename",
+                "google_ads_rename_campaign",
             },
         )
         control.authorize.assert_awaited_once_with(
@@ -72,7 +77,7 @@ class PrivateIngressTests(unittest.IsolatedAsyncioTestCase):
             await send({"type": "http.response.start", "status": 200, "headers": []})
             await send({"type": "http.response.body", "body": b"ok"})
 
-        app = PrivateIngress(inner, "s" * 32, "google-ads-mcp.cuaninsight.com")
+        app = PrivateIngress(inner, "s" * 32, "google-ads-mcp:8080")
 
         async def status(headers):
             events = []
@@ -88,7 +93,7 @@ class PrivateIngressTests(unittest.IsolatedAsyncioTestCase):
             )
             return events[0]["status"]
 
-        host = (b"host", b"google-ads-mcp.cuaninsight.com")
+        host = (b"host", b"google-ads-mcp:8080")
         proof = (b"x-cuan-google-ads-ingress-secret", b"s" * 32)
         self.assertEqual(await status([host, proof]), 200)
         self.assertEqual(await status([proof]), 403)

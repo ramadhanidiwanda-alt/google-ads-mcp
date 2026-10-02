@@ -1,12 +1,13 @@
 """Reject requests that did not pass the private Google Ads Kong route."""
 
 import hmac
+import re
 from typing import Any
 
 
 class PrivateIngress:
     def __init__(self, app: Any, secret: str, host: str) -> None:
-        if len(secret) < 32 or not host or ":" in host:
+        if len(secret) < 32 or not re.fullmatch(r"[a-z0-9.-]+(?::[1-9][0-9]{0,4})?", host):
             raise ValueError("Google Ads private ingress configuration is invalid")
         self.app = app
         self.secret = secret.encode()

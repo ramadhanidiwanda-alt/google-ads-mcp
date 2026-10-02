@@ -17,6 +17,7 @@
 import asyncio
 import unittest
 import json
+import hashlib
 from contextlib import nullcontext
 from io import BytesIO
 from unittest.mock import AsyncMock, Mock, patch
@@ -26,11 +27,91 @@ from ads_mcp.hosted_runtime import (
     CuanGoogleAdsRuntimeClient,
     GoogleAdsRestClient,
     HostedGoogleAdsService,
+    UnifiedGoogleAdsService,
     campaign_query,
     parse_customer_id,
     parse_page_size,
     rename_digest,
 )
+
+
+class UnifiedInvocationTests(unittest.IsolatedAsyncioTestCase):
+    def invocation(self, tool, args, resource="1234567890"):
+        raw = json.dumps(args, separators=(",", ":"), ensure_ascii=False)
+        return {"version": 1, "publicTool": tool, "provider": "google",
+                "resourceId": resource, "canonicalArgumentsJson": raw,
+                "digest": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                "executionId": "execution_123", "permit": "p" * 43}
+
+    async def test_discovery_uses_redeemed_grants_without_google_dispatch(self):
+        ads = AsyncMock()
+        service = UnifiedGoogleAdsService("https://cuan.example/redeem", "service", "s" * 32, ads)
+        service._redeem = AsyncMock(return_value={"ok": True, "provider": "google", "resourceId": "",
+                                                    "resources": [{"id": "1234567890", "name": "Owned"}]})
+        service._finalize = AsyncMock()
+        result = await service.invoke("google_ads_list_customers", self.invocation("google_ads_list_customers", {}, ""))
+        self.assertEqual(result["customers"][0]["id"], "1234567890")
+        ads.search_campaigns.assert_not_awaited()
+        service._finalize.assert_awaited_once()
+
+    async def test_changed_exact_argument_bytes_deny_before_redemption(self):
+        service = UnifiedGoogleAdsService("https://cuan.example/redeem", "service", "s" * 32, AsyncMock())
+        service._redeem = AsyncMock()
+        invocation = self.invocation("google_ads_list_campaigns", {"accountId": "1234567890"})
+        invocation["canonicalArgumentsJson"] += " "
+        with self.assertRaises(PermissionError):
+            await service.invoke("google_ads_list_campaigns", invocation)
+        service._redeem.assert_not_awaited()
+
+    async def test_redeem_denial_releases_validated_invocation(self):
+        service = UnifiedGoogleAdsService("https://cuan.example/redeem", "service", "s" * 32, AsyncMock())
+        service._redeem = AsyncMock(side_effect=PermissionError("permit denied"))
+        service._finalize = AsyncMock()
+        invocation = self.invocation("google_ads_list_campaigns", {"accountId": "1234567890"})
+        with self.assertRaises(PermissionError):
+            await service.invoke("google_ads_list_campaigns", invocation)
+        service._finalize.assert_awaited_once_with(invocation, "failed_before_dispatch")
+
+    async def test_active_campaign_rename_keeps_status_and_dispatches_once(self):
+        row = {"campaign": {"id": "42", "name": "Old", "status": "ENABLED",
+                            "resourceName": "customers/1234567890/campaigns/42"}}
+        renamed = {"campaign": {**row["campaign"], "name": "New"}}
+        ads = AsyncMock()
+        ads.search_campaigns.side_effect = [[row], [renamed]]
+        ads.rename_campaign.return_value = "customers/1234567890/campaigns/42"
+        service = UnifiedGoogleAdsService("https://cuan.example/redeem", "service", "s" * 32, ads)
+        service._redeem = AsyncMock(return_value={"ok": True, "provider": "google", "resourceId": "1234567890",
+                                                    "providerTarget": "1234567890", "accessToken": "transient",
+                                                    "previewId": "preview-123", "approvalDigest": "a" * 64})
+        service._finalize = AsyncMock()
+        invocation = self.invocation("google_ads_rename_campaign", {"accountId": "1234567890", "campaignId": "42",
+            "expectedOldName": "Old", "newName": "New", "confirmed": True,
+            "previewId": "preview-123", "approvalDigest": "a" * 64})
+        with patch.dict("os.environ", {"GOOGLE_ADS_DEVELOPER_TOKEN": "developer"}):
+            result = await service.invoke("google_ads_rename_campaign", invocation)
+        self.assertEqual(result["status"], "ENABLED")
+        ads.rename_campaign.assert_awaited_once()
+        service._finalize.assert_awaited_once_with(invocation, "succeeded")
+
+    async def test_unified_unknown_rename_finalizes_after_one_dispatch(self):
+        row = {"campaign": {"id": "42", "name": "Old", "status": "ENABLED",
+                            "resourceName": "customers/1234567890/campaigns/42"}}
+        ads = AsyncMock()
+        ads.search_campaigns.return_value = [row]
+        ads.rename_campaign.side_effect = TimeoutError("provider timeout")
+        service = UnifiedGoogleAdsService("https://cuan.example/redeem", "service", "s" * 32, ads)
+        service._redeem = AsyncMock(return_value={"ok": True, "provider": "google", "resourceId": "1234567890",
+                                                    "providerTarget": "1234567890", "accessToken": "transient",
+                                                    "previewId": "preview-123", "approvalDigest": "a" * 64})
+        service._finalize = AsyncMock()
+        invocation = self.invocation("google_ads_rename_campaign", {"accountId": "1234567890", "campaignId": "42",
+            "expectedOldName": "Old", "newName": "New", "confirmed": True,
+            "previewId": "preview-123", "approvalDigest": "a" * 64})
+        with patch.dict("os.environ", {"GOOGLE_ADS_DEVELOPER_TOKEN": "developer"}), \
+            self.assertRaisesRegex(RuntimeError, "outcome unknown"):
+            await service.invoke("google_ads_rename_campaign", invocation)
+        ads.rename_campaign.assert_awaited_once()
+        service._finalize.assert_awaited_once_with(invocation, "failed_after_dispatch")
 
 
 class HostedInputTests(unittest.TestCase):
