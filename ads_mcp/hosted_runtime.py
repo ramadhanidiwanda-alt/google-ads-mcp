@@ -15,6 +15,7 @@
 """Cuan-owned credentials and bounded Google Ads operations for HTTP mode."""
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -296,30 +297,52 @@ class GoogleAdsRestClient:
         return headers
 
     async def search_performance(self, credential: dict[str, Any], customer_id: str,
-                                 since: str, until: str, limit: int, offset: int = 0) -> list[dict[str, Any]]:
+                                 since: str, until: str, limit: int, page_token: str = "",
+                                 offset: int = 0) -> dict[str, Any]:
+        # Search has fixed 10,000-row pages. Keep the query identical between
+        # pages and expose bounded subpages through our stateless cursor.
         query = ("SELECT segments.date, campaign.id, campaign.name, "
                  "metrics.cost_micros, customer.currency_code, metrics.clicks, "
                  "metrics.impressions FROM campaign WHERE segments.date BETWEEN "
-                 f"'{since}' AND '{until}' ORDER BY segments.date ASC LIMIT {limit} OFFSET {offset}")
-        return await asyncio.to_thread(self._search_performance, credential, customer_id, query, limit)
+                 f"'{since}' AND '{until}' ORDER BY segments.date ASC, campaign.id ASC")
+        return await asyncio.to_thread(self._search_performance, credential,
+                                       customer_id, query, limit, page_token, offset)
 
     def _search_performance(self, credential: dict[str, Any], customer_id: str,
-                            query: str, limit: int) -> list[dict[str, Any]]:
+                            query: str, limit: int, page_token: str,
+                            offset: int) -> dict[str, Any]:
+        customer_id = parse_customer_id(customer_id)
+        if (type(limit) is not int or not 1 <= limit <= 1000 or
+                type(offset) is not int or not 0 <= offset < 10000 or
+                not isinstance(page_token, str) or len(page_token) > 1024):
+            raise ValueError("Google Ads report page invalid")
+        body = {"query": query}
+        if page_token:
+            body["pageToken"] = page_token
         request = Request(
-            f"https://googleads.googleapis.com/{self.api_version}/customers/{customer_id}/googleAds:searchStream",
-            data=json.dumps({"query": query}).encode(), headers=self._headers(credential), method="POST")
+            f"https://googleads.googleapis.com/{self.api_version}/customers/{customer_id}/googleAds:search",
+            data=json.dumps(body).encode(), headers=self._headers(credential), method="POST")
         try:
             with urlopen(request, timeout=15) as response:
-                payload = json.loads(response.read())
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+                raw = response.read(16 * 1024 * 1024 + 1)
+                if len(raw) > 16 * 1024 * 1024:
+                    raise ValueError("Google Ads report response too large")
+                payload = json.loads(raw)
+        except HTTPError as exc:
+            raise GoogleAdsApiError.from_http_error(exc) from exc
+        except (URLError, TimeoutError, ValueError) as exc:
             raise RuntimeError("Google Ads performance request failed") from exc
-        if not isinstance(payload, list) or any(not isinstance(c, dict) or
-            not isinstance(c.get("results", []), list) for c in payload):
+        rows = payload.get("results", []) if isinstance(payload, dict) else None
+        next_token = payload.get("nextPageToken", "") if isinstance(payload, dict) else None
+        if (not isinstance(rows, list) or len(rows) > 10000 or
+                any(not isinstance(row, dict) for row in rows) or
+                not isinstance(next_token, str) or len(next_token) > 1024 or
+                (next_token and next_token == page_token) or offset > len(rows)):
             raise ValueError("Google Ads performance response invalid")
-        rows = [row for chunk in payload for row in chunk.get("results", [])]
-        if len(rows) > limit:
-            raise ValueError("Google Ads performance exceeded row limit")
-        return rows
+        end = min(offset + limit, len(rows))
+        next_page = {"token": page_token, "offset": end} if end < len(rows) else (
+            {"token": next_token, "offset": 0} if next_token else None)
+        return {"rows": rows[offset:end], "next": next_page}
 
 
     def _search_campaigns(
@@ -576,14 +599,31 @@ class UnifiedGoogleAdsService:
                 raise ValueError("Google Ads report limit invalid")
             prefix = hashlib.sha256(f"{customer}:{since}:{until}:{limit}".encode()).hexdigest()[:16]
             cursor = args.get("cursor")
-            offset = 0
+            page_token, offset = "", 0
             if cursor is not None:
-                match = re.fullmatch(rf"{prefix}:([0-9]{{1,7}})", cursor) if isinstance(cursor, str) else None
-                if match is None:
+                if not isinstance(cursor, str) or not cursor.startswith(prefix + ":") or len(cursor) > 2048:
                     raise ValueError("Google Ads report cursor invalid")
-                offset = int(match.group(1))
-            rows = await self.ads.search_performance(credential, customer, since, until, limit, offset)
-            return {"rows": rows, "nextCursor": f"{prefix}:{offset + limit}" if len(rows) == limit else None}
+                encoded = cursor[len(prefix) + 1:]
+                try:
+                    if not re.fullmatch(r"[A-Za-z0-9_-]+", encoded):
+                        raise ValueError()
+                    page = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+                    if (not isinstance(page, dict) or set(page) != {"token", "offset"} or
+                            not isinstance(page["token"], str) or len(page["token"]) > 1024 or
+                            type(page["offset"]) is not int or not 0 <= page["offset"] < 10000):
+                        raise ValueError()
+                    page_token, offset = page["token"], page["offset"]
+                except (ValueError, TypeError) as exc:
+                    raise ValueError("Google Ads report cursor invalid") from exc
+            page = await self.ads.search_performance(credential, customer, since, until,
+                                                     limit, page_token, offset)
+            next_cursor = None
+            if page["next"] is not None:
+                encoded = base64.urlsafe_b64encode(json.dumps(page["next"],
+                    separators=(",", ":")).encode()).decode().rstrip("=")
+                next_cursor = prefix + ":" + encoded
+            return {"rows": page["rows"], "nextCursor": next_cursor}
+
         campaign_id = args.get("campaignId")
         expected = args.get("expectedOldName")
         proposed = args.get("newName")

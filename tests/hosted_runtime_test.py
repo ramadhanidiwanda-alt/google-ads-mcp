@@ -73,6 +73,39 @@ class GoogleAdsApiFailureTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "Google Ads API HTTP 400")
 
 
+class GoogleAdsReportPagingTests(unittest.TestCase):
+    def test_report_uses_native_page_token_and_bounded_subpages(self):
+        client = GoogleAdsRestClient(api_version="v25")
+        for token, offset, expected, next_offset in [("", 0, [1, 2], 2), ("", 2, [3], 0),
+                                                    ("native-next", 0, [1, 2], 2)]:
+            with self.subTest(token=token, offset=offset):
+                body = {"results": [{"campaign": {"id": str(i)}} for i in [1, 2, 3]],
+                        "nextPageToken": "native-next" if not token else "native-last"}
+                with patch("ads_mcp.hosted_runtime.urlopen", return_value=nullcontext(BytesIO(json.dumps(body).encode()))) as send:
+                    page = asyncio.run(client.search_performance({"accessToken": "transient"},
+                        "1234567890", "2026-10-01", "2026-10-01", 2, token, offset))
+                req = send.call_args.args[0]
+                query = json.loads(req.data)
+                self.assertTrue(req.full_url.endswith("/googleAds:search"))
+                self.assertNotIn("OFFSET", query["query"])
+                self.assertNotIn("LIMIT", query["query"])
+                self.assertNotIn("pageSize", query)
+                self.assertEqual(query.get("pageToken", ""), token)
+                self.assertEqual([int(row["campaign"]["id"]) for row in page["rows"]], expected)
+                self.assertEqual(page["next"]["offset"], next_offset)
+
+    def test_report_final_page_ends_and_invalid_page_offset_fails(self):
+        client = GoogleAdsRestClient(api_version="v25")
+        with patch("ads_mcp.hosted_runtime.urlopen", return_value=nullcontext(BytesIO(b'{"results":[]}'))):
+            result = asyncio.run(client.search_performance({"accessToken":"t"}, "1234567890",
+                "2026-10-01", "2026-10-01", 2))
+        self.assertEqual(result, {"rows": [], "next": None})
+        with patch("ads_mcp.hosted_runtime.urlopen", return_value=nullcontext(BytesIO(b'{"results":[]}'))):
+            with self.assertRaises(ValueError):
+                asyncio.run(client.search_performance({"accessToken":"t"}, "1234567890",
+                    "2026-10-01", "2026-10-01", 2, "", 4))
+
+
 class UnifiedInvocationTests(unittest.IsolatedAsyncioTestCase):
     def invocation(self, tool, args, resource="1234567890"):
         raw = json.dumps(args, separators=(",", ":"), ensure_ascii=False)
@@ -80,6 +113,30 @@ class UnifiedInvocationTests(unittest.IsolatedAsyncioTestCase):
                 "resourceId": resource, "canonicalArgumentsJson": raw,
                 "digest": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
                 "executionId": "execution_123", "permit": "p" * 43}
+
+    async def test_report_cursor_continues_subpage_and_rejects_changed_context(self):
+        ads = AsyncMock()
+        ads.search_performance.side_effect = [
+            {"rows": [{"campaign": {"id": "1"}}, {"campaign": {"id": "2"}}],
+             "next": {"token": "", "offset": 2}},
+            {"rows": [{"campaign": {"id": "3"}}], "next": None}]
+        service = UnifiedGoogleAdsService("https://cuan.example/redeem", "service", "s" * 32, ads)
+        service._redeem = AsyncMock(return_value={"ok": True, "provider": "google",
+            "resourceId": "1234567890", "accessToken": "transient"})
+        service._finalize = AsyncMock()
+        args = {"accountId": "1234567890", "since": "2026-10-01", "until": "2026-10-01", "limit": 2}
+        tool = "google_ads_get_campaign_performance"
+        first = await service.invoke(tool, self.invocation(tool, args))
+        second = await service.invoke(tool, self.invocation(tool, {**args, "cursor": first["nextCursor"]}))
+        self.assertEqual(ads.search_performance.await_args_list[1].args[-2:], ("", 2))
+        self.assertEqual(second["rows"][0]["campaign"]["id"], "3")
+        self.assertIsNone(second["nextCursor"])
+        for invalid in ["bad", first["nextCursor"].split(":")[0] + ":W10"]:
+            with self.assertRaises(ValueError):
+                await service.invoke(tool, self.invocation(tool, {**args, "cursor": invalid}))
+        with self.assertRaises(ValueError):
+            await service.invoke(tool, self.invocation(tool, {**args, "since": "2026-09-30", "cursor": first["nextCursor"]}))
+        self.assertEqual(ads.search_performance.await_count, 2)
 
     async def test_discovery_uses_redeemed_grants_without_google_dispatch(self):
         ads = AsyncMock()
